@@ -56,6 +56,57 @@ class CorpusFlowTest(unittest.TestCase):
         with self.assertRaisesRegex(DomainError, "标注员"):
             self.db.assign(self.item2, self.arb)
 
+    def test_recusal_return_readjudicate_freeze_and_export(self):
+        arb2 = self.db.add_user("仲裁二", "arbitrator")
+        for item in (self.item1, self.item2):
+            self.db.assign(item, self.a1)
+            self.db.assign(item, self.a2)
+        self.db.submit_annotation(self.item1, self.a1, "正向")
+        self.db.submit_annotation(self.item1, self.a2, "负向")
+        self.db.submit_annotation(self.item2, self.a1, "中性")
+        self.db.submit_annotation(self.item2, self.a2, "中性")
+        first = self.db.adjudicate(self.item1, "正向", "描述明确表达满意", self.arb)
+
+        # 登记回避后，已有结论退回待复议，状态区可见数量
+        self.db.register_recusal(self.item1, self.arb, "与条目作者存在利益关系", self.mgr)
+        self.assertEqual(1, self.db.snapshot()["pending_reviews"])
+
+        # 回避后仍可查看材料，但提交结论被拒绝
+        self.assertEqual(self.item1, self.db.get_item_for_user(self.item1, self.arb)["id"])
+        with self.assertRaisesRegex(DomainError, "回避"):
+            self.db.adjudicate(self.item1, "负向", "回避后仍尝试提交结论", self.arb)
+
+        # 复议未结束不能冻结
+        with self.assertRaisesRegex(DomainError, "待复议"):
+            self.db.freeze_batch(self.batch, self.mgr)
+
+        # 另一位仲裁员重判，新旧两份结论都保留
+        second = self.db.adjudicate(self.item1, "负向", "复核后应判为负向", arb2)
+        statuses = [r["status"] for r in self.db.conn.execute(
+            "SELECT status FROM adjudications WHERE item_id=? ORDER BY id", (self.item1,)
+        )]
+        self.assertEqual(["superseded", "active"], statuses)
+        self.assertEqual(0, self.db.snapshot()["pending_reviews"])
+
+        # 冻结后导出注明最终采用的结论
+        self.db.freeze_batch(self.batch, self.mgr)
+        record = self.db.export_gold(self.batch)["records"][0]
+        self.assertEqual("adjudication", record["source"])
+        self.assertEqual(second, record["adjudication_id"])
+        self.assertNotEqual(first, record["adjudication_id"])
+        self.assertEqual("仲裁二", record["arbitrator"])
+
+    def test_recusal_registration_validation(self):
+        with self.assertRaisesRegex(DomainError, "仲裁员"):
+            self.db.register_recusal(self.item1, self.a1, "利益关系", self.mgr)
+        with self.assertRaisesRegex(DomainError, "管理员"):
+            self.db.register_recusal(self.item1, self.arb, "利益关系", self.a1)
+        with self.assertRaisesRegex(DomainError, "原因"):
+            self.db.register_recusal(self.item1, self.arb, "  ", self.mgr)
+        self.db.register_recusal(self.item1, self.arb, "利益关系", self.mgr)
+        with self.assertRaisesRegex(DomainError, "已登记"):
+            self.db.register_recusal(self.item1, self.arb, "重复登记", self.mgr)
+
 
 if __name__ == "__main__":
     unittest.main()

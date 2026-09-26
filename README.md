@@ -26,7 +26,7 @@ python -m unittest discover -s tests -v
 
 - `POST /api/users`、`POST /api/guidelines`、`POST /api/batches`
 - `POST /api/batches/{id}/items`、`POST /api/batches/{id}/assign`
-- `POST /api/annotations`、`POST /api/adjudications`
+- `POST /api/annotations`、`POST /api/adjudications`、`POST /api/recusals`
 - `GET /api/items/{id}?user_id=`
 - `GET /api/batches/{id}/disagreements`
 - `GET /api/batches/{id}/consistency`
@@ -34,3 +34,11 @@ python -m unittest discover -s tests -v
 - `GET /api/batches/{id}/gold`
 
 一致性同时返回逐条成对一致率和 Fleiss Kappa。冻结要求每条至少有两人标注、没有未仲裁分歧；冻结后不能修改标注，导出结果来自不可变的 `gold_records`。
+
+## 仲裁回避与复议
+
+- `POST /api/recusals` 为争议条目登记回避：`item_id`、`arbitrator_id`（回避人，须为仲裁员）、`reason`（原因）、`handler_id`（处理人，须为管理员）。
+- 登记后该仲裁员仍可查看条目材料，但提交结论会被拒绝；若他已有生效结论，该结论退回为 `returned`（待复议）。
+- 由另一位仲裁员重判，旧结论保留为 `superseded`，新结论为 `active`，新旧两份均留档。
+- 批次内存在待复议结论时不能冻结；导出金标准的每条记录通过 `adjudication_id` 与 `arbitrator` 注明最终采用了哪份结论。
+- `/api/state` 返回 `pending_reviews`（待复议数量）、`recusals` 和 `adjudications` 历史，页面状态区可见。

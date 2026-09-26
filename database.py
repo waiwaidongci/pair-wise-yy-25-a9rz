@@ -85,12 +85,22 @@ class CorpusDB:
             );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
               guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
               final_label TEXT NOT NULL,
               reason TEXT NOT NULL,
               arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','returned','superseded')),
               created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recusals (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+              arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL,
+              handler_id INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              UNIQUE(item_id, arbitrator_id)
             );
             CREATE TABLE IF NOT EXISTS discussions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,13 +129,47 @@ class CorpusDB:
             """
         )
         self.conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(adjudications)")}
+        if "status" in cols:
+            return
+        # 旧库的 adjudications 没有 status 且 item_id 唯一，重建表以支持一条目保留多份结论
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            with self.transaction():
+                self.conn.execute(
+                    """
+                    CREATE TABLE adjudications_migrated (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                      guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+                      final_label TEXT NOT NULL,
+                      reason TEXT NOT NULL,
+                      arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+                      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','returned','superseded')),
+                      created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                self.conn.execute(
+                    "INSERT INTO adjudications_migrated(id,item_id,guideline_id,final_label,reason,arbitrator_id,status,created_at) "
+                    "SELECT id,item_id,guideline_id,final_label,reason,arbitrator_id,'active',created_at FROM adjudications"
+                )
+                self.conn.execute("DROP TABLE adjudications")
+                self.conn.execute("ALTER TABLE adjudications_migrated RENAME TO adjudications")
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
             return
         a1 = self.add_user("标注员甲", "annotator")
         a2 = self.add_user("标注员乙", "annotator")
-        arb = self.add_user("仲裁员", "arbitrator")
+        self.add_user("仲裁员", "arbitrator")
+        self.add_user("仲裁员乙", "arbitrator")
+        self.add_user("管理员", "manager")
         guideline = self.add_guideline("v1", "标签仅可为 正向/负向/中性；先独立标注，不得查看他人答案。")
         batch = self.create_batch("情感标注示例", guideline)
         item1 = self.add_item(batch, 1, "这个更新让工作流畅了很多。")
@@ -209,7 +253,10 @@ class CorpusDB:
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
         with self.transaction():
-            self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
+            # 标注变更后旧结论不再生效，但保留历史供追溯
+            self.conn.execute(
+                "UPDATE adjudications SET status='superseded' WHERE item_id=? AND status IN ('active','returned')", (item_id,)
+            )
             try:
                 cur = self.conn.execute(
                     "INSERT INTO annotations(item_id,annotator_id,guideline_id,label,comment,created_at) VALUES(?,?,?,?,?,?)",
@@ -280,7 +327,9 @@ class CorpusDB:
                 (item["id"], batch["guideline_id"]),
             ).fetchall()
             labels = {row["label"] for row in rows}
-            adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+            adj = self.conn.execute(
+                "SELECT * FROM adjudications WHERE item_id=? AND status='active'", (item["id"],)
+            ).fetchone()
             if len(rows) >= 2 and len(labels) > 1 and not adj:
                 result.append({
                     "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
@@ -297,26 +346,57 @@ class CorpusDB:
             raise DomainError("条目或仲裁员无效")
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能重新仲裁")
+        if self.conn.execute(
+            "SELECT 1 FROM recusals WHERE item_id=? AND arbitrator_id=?", (item_id, arbitrator_id)
+        ).fetchone():
+            raise DomainError("该仲裁员已回避此条目，不能提交结论")
         rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
         if len(rows) < 2:
             raise DomainError("至少需要两份标注才能仲裁")
         if not final_label.strip() or len(reason.strip()) < 5:
             raise DomainError("最终标签必填，仲裁理由至少5个字符")
         with self.transaction():
+            # 新结论生效，旧结论（含退回待复议的）保留为历史
+            self.conn.execute(
+                "UPDATE adjudications SET status='superseded' WHERE item_id=? AND status IN ('active','returned')", (item_id,)
+            )
+            cur = self.conn.execute(
+                "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,status,created_at) "
+                "VALUES(?,?,?,?,?,'active',?)",
+                (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
+            )
+        return int(cur.lastrowid)
+
+    def register_recusal(self, item_id: int, arbitrator_id: int, reason: str, handler_id: int) -> int:
+        item = self.conn.execute(
+            "SELECT i.id,b.status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+        ).fetchone()
+        arbitrator = self.conn.execute("SELECT role FROM users WHERE id=?", (arbitrator_id,)).fetchone()
+        handler = self.conn.execute("SELECT role FROM users WHERE id=?", (handler_id,)).fetchone()
+        if not item:
+            raise DomainError("条目不存在")
+        if item["status"] == "frozen":
+            raise DomainError("冻结批次不能登记回避")
+        if not arbitrator or arbitrator["role"] != "arbitrator":
+            raise DomainError("回避人必须是仲裁员")
+        if not handler or handler["role"] != "manager":
+            raise DomainError("处理人必须是管理员")
+        if not reason.strip():
+            raise DomainError("回避原因不能为空")
+        with self.transaction():
             try:
                 cur = self.conn.execute(
-                    "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
+                    "INSERT INTO recusals(item_id,arbitrator_id,reason,handler_id,created_at) VALUES(?,?,?,?,?)",
+                    (item_id, arbitrator_id, reason.strip(), handler_id, datetime.now().isoformat()),
                 )
-            except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=?",
-                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id),
-                )
-                adjudication_id = self.conn.execute("SELECT id FROM adjudications WHERE item_id=?", (item_id,)).fetchone()["id"]
-            else:
-                adjudication_id = int(cur.lastrowid)
-        return int(adjudication_id)
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该仲裁员已登记回避此条目") from exc
+            # 回避人已有的生效结论退回待复议，由其他仲裁员重判
+            self.conn.execute(
+                "UPDATE adjudications SET status='returned' WHERE item_id=? AND arbitrator_id=? AND status='active'",
+                (item_id, arbitrator_id),
+            )
+        return int(cur.lastrowid)
 
     def consistency(self, batch_id: int) -> dict:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
@@ -367,6 +447,13 @@ class CorpusDB:
         items = self.conn.execute("SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         if not items:
             raise DomainError("空批次不能冻结")
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM adjudications a JOIN items i ON i.id=a.item_id "
+            "WHERE i.batch_id=? AND a.status='returned'",
+            (batch_id,),
+        ).fetchone()[0]
+        if pending:
+            raise DomainError(f"仍有 {pending} 条结论待复议，不能冻结")
         disagreements = self.disagreements(batch_id)
         if disagreements:
             raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
@@ -386,7 +473,9 @@ class CorpusDB:
                 labels = [r["label"] for r in self.conn.execute(
                     "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
                 ).fetchall()]
-                adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+                adj = self.conn.execute(
+                "SELECT * FROM adjudications WHERE item_id=? AND status='active'", (item["id"],)
+            ).fetchone()
                 if adj:
                     label, source, adj_id = adj["final_label"], "adjudication", adj["id"]
                 else:
@@ -408,7 +497,11 @@ class CorpusDB:
             raise DomainError("只有已冻结批次可以导出金标准")
         freeze = self.conn.execute("SELECT * FROM batch_freezes WHERE batch_id=?", (batch_id,)).fetchone()
         rows = self.conn.execute(
-            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.adjudication_id,g.frozen_at,"
+            "adj.arbitrator_id,u.name AS arbitrator "
+            "FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "LEFT JOIN adjudications adj ON adj.id=g.adjudication_id "
+            "LEFT JOIN users u ON u.id=adj.arbitrator_id "
             "WHERE g.batch_id=? ORDER BY i.ordinal", (batch_id,)
         ).fetchall()
         return {
@@ -422,4 +515,14 @@ class CorpusDB:
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
             "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "pending_reviews": self.conn.execute(
+                "SELECT COUNT(*) FROM adjudications WHERE status='returned'"
+            ).fetchone()[0],
+            "recusals": [dict(r) for r in self.conn.execute(
+                "SELECT r.*,u.name AS arbitrator,h.name AS handler FROM recusals r "
+                "JOIN users u ON u.id=r.arbitrator_id JOIN users h ON h.id=r.handler_id ORDER BY r.id"
+            )],
+            "adjudications": [dict(r) for r in self.conn.execute(
+                "SELECT a.*,u.name AS arbitrator FROM adjudications a JOIN users u ON u.id=a.arbitrator_id ORDER BY a.id"
+            )],
         }
