@@ -83,6 +83,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(201, {"ok": True, "id": self.db.adjudicate(int(body.get("item_id", 0)), str(body.get("final_label", "")), str(body.get("reason", "")), int(body.get("arbitrator_id", 0)))})
             if path == "/api/discussions":
                 return self._json(201, {"ok": True, "id": self.db.add_discussion(int(body.get("item_id", 0)), int(body.get("author_id", 0)), str(body.get("body", "")), bool(body.get("contains_answer", False)))})
+            if path == "/api/recusals":
+                return self._json(201, {"ok": True, "id": self.db.register_recusal(int(body.get("item_id", 0)), int(body.get("arbitrator_id", 0)), str(body.get("reason", "")), int(body.get("handler_id", 0)))})
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "freeze":
                 return self._json(200, {"ok": True, **self.db.freeze_batch(int(parts[2]), int(body.get("manager_id", 0)))})
             self._json(404, {"ok": False, "error": "接口不存在"})

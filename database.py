@@ -85,12 +85,26 @@ class CorpusDB:
             );
             CREATE TABLE IF NOT EXISTS adjudications (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
               guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
               final_label TEXT NOT NULL,
               reason TEXT NOT NULL,
               arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','pending_reconsider','superseded')),
+              recusal_id INTEGER REFERENCES recusals(id),
               created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recusals (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+              arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+              reason TEXT NOT NULL,
+              handler_id INTEGER NOT NULL REFERENCES users(id),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','resolved')),
+              resolved_adjudication_id INTEGER REFERENCES adjudications(id),
+              created_at TEXT NOT NULL,
+              resolved_at TEXT,
+              UNIQUE(item_id, arbitrator_id)
             );
             CREATE TABLE IF NOT EXISTS discussions (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +132,32 @@ class CorpusDB:
             );
             """
         )
-        self.conn.commit()
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(adjudications)")}
+        if "status" not in cols:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            self.conn.execute("PRAGMA legacy_alter_table=ON")
+            self.conn.executescript(
+                """
+                ALTER TABLE adjudications RENAME TO adjudications_old;
+                CREATE TABLE adjudications (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                  guideline_id INTEGER NOT NULL REFERENCES guidelines(id),
+                  final_label TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  arbitrator_id INTEGER NOT NULL REFERENCES users(id),
+                  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','pending_reconsider','superseded')),
+                  recusal_id INTEGER REFERENCES recusals(id),
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO adjudications(id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at)
+                SELECT id,item_id,guideline_id,final_label,reason,arbitrator_id,created_at FROM adjudications_old;
+                DROP TABLE adjudications_old;
+                """
+            )
+            self.conn.execute("PRAGMA legacy_alter_table=OFF")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.commit()
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -126,6 +165,8 @@ class CorpusDB:
         a1 = self.add_user("标注员甲", "annotator")
         a2 = self.add_user("标注员乙", "annotator")
         arb = self.add_user("仲裁员", "arbitrator")
+        arb2 = self.add_user("仲裁员乙", "arbitrator")
+        mgr = self.add_user("管理员", "manager")
         guideline = self.add_guideline("v1", "标签仅可为 正向/负向/中性；先独立标注，不得查看他人答案。")
         batch = self.create_batch("情感标注示例", guideline)
         item1 = self.add_item(batch, 1, "这个更新让工作流畅了很多。")
@@ -209,6 +250,11 @@ class CorpusDB:
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能修改标注")
         with self.transaction():
+            self.conn.execute(
+                "UPDATE recusals SET status='pending',resolved_adjudication_id=NULL,resolved_at=NULL "
+                "WHERE item_id=? AND resolved_adjudication_id IS NOT NULL",
+                (item_id,),
+            )
             self.conn.execute("DELETE FROM adjudications WHERE item_id=?", (item_id,))
             try:
                 cur = self.conn.execute(
@@ -266,6 +312,21 @@ class CorpusDB:
         payload = dict(item)
         payload["own_annotation"] = dict(own) if own else None
         payload["discussions"] = discussions
+        recusals = []
+        for row in self.conn.execute(
+            "SELECT r.id,r.arbitrator_id,r.reason,r.handler_id,r.status,r.created_at,u.name AS arbitrator_name "
+            "FROM recusals r JOIN users u ON u.id=r.arbitrator_id WHERE r.item_id=? ORDER BY r.id", (item_id,)
+        ).fetchall():
+            entry = dict(row)
+            entry["recused"] = row["arbitrator_id"] == user_id
+            recusals.append(entry)
+        payload["recusals"] = recusals
+        payload["viewing_recused"] = any(r["recused"] for r in recusals)
+        active = self.conn.execute(
+            "SELECT a.*,u.name AS arbitrator_name FROM adjudications a JOIN users u ON u.id=a.arbitrator_id "
+            "WHERE a.item_id=? AND a.status='active'", (item_id,)
+        ).fetchone()
+        payload["adjudication"] = dict(active) if active else None
         return payload
 
     def disagreements(self, batch_id: int) -> list[dict]:
@@ -280,13 +341,55 @@ class CorpusDB:
                 (item["id"], batch["guideline_id"]),
             ).fetchall()
             labels = {row["label"] for row in rows}
-            adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+            adj = self.conn.execute(
+                "SELECT * FROM adjudications WHERE item_id=? AND status='active'", (item["id"],)
+            ).fetchone()
             if len(rows) >= 2 and len(labels) > 1 and not adj:
                 result.append({
                     "item_id": item["id"], "ordinal": item["ordinal"], "text": item["text"],
                     "labels": [dict(row) for row in rows],
                 })
         return result
+
+    def register_recusal(self, item_id: int, arbitrator_id: int, reason: str, handler_id: int) -> int:
+        item = self.conn.execute(
+            "SELECT batch_id,status FROM items i JOIN batches b ON b.id=i.batch_id WHERE i.id=?", (item_id,)
+        ).fetchone()
+        user = self.conn.execute("SELECT role FROM users WHERE id=?", (arbitrator_id,)).fetchone()
+        handler = self.conn.execute("SELECT 1 FROM users WHERE id=?", (handler_id,)).fetchone()
+        if not item:
+            raise DomainError("条目不存在")
+        if not user or user["role"] != "arbitrator":
+            raise DomainError("回避人必须是仲裁员")
+        if not handler:
+            raise DomainError("处理人不存在")
+        if not reason.strip():
+            raise DomainError("回避原因不能为空")
+        if item["status"] == "frozen":
+            raise DomainError("批次已冻结，不能登记回避")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO recusals(item_id,arbitrator_id,reason,handler_id,status,created_at) VALUES(?,?,?,?,?,?)",
+                    (item_id, arbitrator_id, reason.strip(), handler_id, "pending", now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("该仲裁员在此条目上已登记回避") from exc
+            recusal_id = int(cur.lastrowid)
+            # 已有结论先退回待复议，结论本身保留（新旧两份结果都留档）
+            self.conn.execute(
+                "UPDATE adjudications SET status='pending_reconsider' WHERE item_id=? AND status='active'",
+                (item_id,),
+            )
+        return recusal_id
+
+    def _recusal_guard(self, item_id: int, arbitrator_id: int) -> None:
+        row = self.conn.execute(
+            "SELECT status FROM recusals WHERE item_id=? AND arbitrator_id=?", (item_id, arbitrator_id)
+        ).fetchone()
+        if row:
+            raise DomainError("该仲裁员与本条目标注存在利益关系，已登记回避，不能提交结论（仍可查看材料）")
 
     def adjudicate(self, item_id: int, final_label: str, reason: str, arbitrator_id: int) -> int:
         user = self.conn.execute("SELECT role FROM users WHERE id=?", (arbitrator_id,)).fetchone()
@@ -295,6 +398,7 @@ class CorpusDB:
         ).fetchone()
         if not item or not user or user["role"] != "arbitrator":
             raise DomainError("条目或仲裁员无效")
+        self._recusal_guard(item_id, arbitrator_id)
         if item["status"] == "frozen":
             raise DomainError("冻结批次不能重新仲裁")
         rows = self.conn.execute("SELECT label FROM annotations WHERE item_id=?", (item_id,)).fetchall()
@@ -302,21 +406,30 @@ class CorpusDB:
             raise DomainError("至少需要两份标注才能仲裁")
         if not final_label.strip() or len(reason.strip()) < 5:
             raise DomainError("最终标签必填，仲裁理由至少5个字符")
+        now = datetime.now().isoformat()
         with self.transaction():
-            try:
-                cur = self.conn.execute(
-                    "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,created_at) VALUES(?,?,?,?,?,?)",
-                    (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat()),
+            # 重判：原结论（含退回待复议的）保留为历史版本
+            self.conn.execute(
+                "UPDATE adjudications SET status='superseded' WHERE item_id=? AND status IN ('active','pending_reconsider')",
+                (item_id,),
+            )
+            open_recusals = self.conn.execute(
+                "SELECT id FROM recusals WHERE item_id=? AND status='pending'", (item_id,)
+            ).fetchall()
+            linked_recusal = open_recusals[0]["id"] if open_recusals else None
+            cur = self.conn.execute(
+                "INSERT INTO adjudications(item_id,guideline_id,final_label,reason,arbitrator_id,status,recusal_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (item_id, item["guideline_id"], final_label.strip(), reason.strip(), arbitrator_id,
+                 "active", linked_recusal, now),
+            )
+            adjudication_id = int(cur.lastrowid)
+            for recusal in open_recusals:
+                self.conn.execute(
+                    "UPDATE recusals SET status='resolved',resolved_adjudication_id=?,resolved_at=? WHERE id=?",
+                    (adjudication_id, now, recusal["id"]),
                 )
-            except sqlite3.IntegrityError:
-                cur = self.conn.execute(
-                    "UPDATE adjudications SET final_label=?,reason=?,arbitrator_id=?,created_at=? WHERE item_id=?",
-                    (final_label.strip(), reason.strip(), arbitrator_id, datetime.now().isoformat(), item_id),
-                )
-                adjudication_id = self.conn.execute("SELECT id FROM adjudications WHERE item_id=?", (item_id,)).fetchone()["id"]
-            else:
-                adjudication_id = int(cur.lastrowid)
-        return int(adjudication_id)
+        return adjudication_id
 
     def consistency(self, batch_id: int) -> dict:
         batch = self.conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
@@ -367,6 +480,13 @@ class CorpusDB:
         items = self.conn.execute("SELECT id FROM items WHERE batch_id=? ORDER BY ordinal", (batch_id,)).fetchall()
         if not items:
             raise DomainError("空批次不能冻结")
+        item_ids = [row["id"] for row in items]
+        placeholders = ",".join("?" for _ in item_ids)
+        pending = self.conn.execute(
+            f"SELECT COUNT(*) FROM recusals WHERE status='pending' AND item_id IN ({placeholders})", item_ids
+        ).fetchone()[0]
+        if pending:
+            raise DomainError(f"仍有 {pending} 条回避复议未结束，不能冻结")
         disagreements = self.disagreements(batch_id)
         if disagreements:
             raise DomainError(f"仍有 {len(disagreements)} 条分歧未仲裁")
@@ -386,7 +506,9 @@ class CorpusDB:
                 labels = [r["label"] for r in self.conn.execute(
                     "SELECT label FROM annotations WHERE item_id=? AND guideline_id=?", (item["id"], batch["guideline_id"])
                 ).fetchall()]
-                adj = self.conn.execute("SELECT * FROM adjudications WHERE item_id=?", (item["id"],)).fetchone()
+                adj = self.conn.execute(
+                    "SELECT * FROM adjudications WHERE item_id=? AND status='active'", (item["id"],)
+                ).fetchone()
                 if adj:
                     label, source, adj_id = adj["final_label"], "adjudication", adj["id"]
                 else:
@@ -408,18 +530,74 @@ class CorpusDB:
             raise DomainError("只有已冻结批次可以导出金标准")
         freeze = self.conn.execute("SELECT * FROM batch_freezes WHERE batch_id=?", (batch_id,)).fetchone()
         rows = self.conn.execute(
-            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "SELECT g.item_id,i.ordinal,i.text,g.label,g.source,g.frozen_at,"
+            "g.adjudication_id,a.arbitrator_id,u.name AS arbitrator_name,a.created_at AS adjudicated_at "
+            "FROM gold_records g JOIN items i ON i.id=g.item_id "
+            "LEFT JOIN adjudications a ON a.id=g.adjudication_id "
+            "LEFT JOIN users u ON u.id=a.arbitrator_id "
             "WHERE g.batch_id=? ORDER BY i.ordinal", (batch_id,)
         ).fetchall()
+        records = []
+        for row in rows:
+            record = dict(row)
+            adopted_id = record.get("adjudication_id")
+            history = []
+            if adopted_id is not None:
+                old_rows = self.conn.execute(
+                    "SELECT a.id,a.final_label,a.reason,a.arbitrator_id,u.name AS arbitrator_name,a.status,a.created_at "
+                    "FROM adjudications a LEFT JOIN users u ON u.id=a.arbitrator_id "
+                    "WHERE a.item_id=? AND a.id!=? ORDER BY a.id",
+                    (record["item_id"], adopted_id),
+                ).fetchall()
+                history = [dict(r) for r in old_rows]
+                record["adopted_adjudication_id"] = adopted_id
+                record["adoption_note"] = (
+                    f"最终采用第 {len(history) + 1} 份结论（adjudication_id={adopted_id}，"
+                    f"仲裁员：{record['arbitrator_name']}）；该条目共 {len(history) + 1} 份结论，旧版本已保留"
+                )
+            else:
+                record["adoption_note"] = "标注一致，采用共识标签"
+            record["prior_adjudications"] = history
+            records.append(record)
         return {
             "batch_id": batch_id, "batch_name": batch["name"], "frozen_at": freeze["frozen_at"],
-            "metrics": json.loads(freeze["metrics_json"]), "records": [dict(row) for row in rows],
+            "metrics": json.loads(freeze["metrics_json"]), "records": records,
         }
 
+    def pending_reconsider_count(self, batch_id: int | None = None) -> int:
+        if batch_id is None:
+            return int(self.conn.execute(
+                "SELECT COUNT(*) FROM recusals WHERE status='pending'"
+            ).fetchone()[0])
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM recusals r JOIN items i ON i.id=r.item_id "
+            "WHERE i.batch_id=? AND r.status='pending'", (batch_id,)
+        ).fetchone()[0])
+
     def snapshot(self) -> dict:
+        recusals = [dict(r) for r in self.conn.execute(
+            "SELECT r.*,u.name AS arbitrator_name,h.name AS handler_name FROM recusals r "
+            "JOIN users u ON u.id=r.arbitrator_id JOIN users h ON h.id=r.handler_id ORDER BY r.id"
+        )]
+        adjudications = [dict(r) for r in self.conn.execute(
+            "SELECT a.id,a.item_id,a.final_label,a.reason,a.arbitrator_id,u.name AS arbitrator_name,"
+            "a.status,a.recusal_id,a.created_at FROM adjudications a JOIN users u ON u.id=a.arbitrator_id ORDER BY a.id"
+        )]
+        batches = [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")]
+        pending_by_batch = {
+            row["batch_id"]: row["n"] for row in self.conn.execute(
+                "SELECT i.batch_id,COUNT(*) AS n FROM recusals r JOIN items i ON i.id=r.item_id "
+                "WHERE r.status='pending' GROUP BY i.batch_id"
+            )
+        }
+        for batch in batches:
+            batch["pending_reconsider"] = pending_by_batch.get(batch["id"], 0)
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "guidelines": [dict(r) for r in self.conn.execute("SELECT * FROM guidelines ORDER BY id")],
-            "batches": [dict(r) for r in self.conn.execute("SELECT * FROM batches ORDER BY id")],
+            "batches": batches,
             "items": [dict(r) for r in self.conn.execute("SELECT * FROM items ORDER BY batch_id,ordinal")],
+            "adjudications": adjudications,
+            "recusals": recusals,
+            "pending_reconsider_count": sum(pending_by_batch.values()),
         }
